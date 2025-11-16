@@ -29,6 +29,8 @@ MANIFEST
 calibration_kreo1
 calibration_kreo2
 mobile_calibration
+cpp_based
+.vscode
 
 
 # PyInstaller
