@@ -5,8 +5,8 @@ DICT_TYPE = cv2.aruco.DICT_APRILTAG_36h11
 
 CAM_SOURCES = {
     "mobile":"http://192.168.137.110:8080/video",
-    "kreo1": 2,
-    "kreo2": 4
+    "kreo1": 4,
+    "kreo2": 0
 }
 
 # parameter grids. Tweak if needed
