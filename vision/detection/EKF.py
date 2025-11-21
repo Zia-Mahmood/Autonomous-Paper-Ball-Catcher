@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # triangulation.py (patched - EKF tuning, logging, velocity reset)
-import cv2, zmq, numpy as np, time, threading, queue, traceback, sys, os
+import cv2, zmq, numpy as np, time, threading, queue, traceback, sys, os, csv
 from collections import deque, defaultdict
 import math
 import json
@@ -114,126 +114,125 @@ TAG_WORLD_MAP = build_tag_world_map_from_centers(TAG_POSITIONS, TAG_SIZES)
 
 # ---------- EKF, robot-center helpers, prediction logging ----------
 class BallEKF:
-    """
-    6-state EKF: [X, Y, Z, Vx, Vy, Vz].
-    Tuned: pos_sigma=0.02 m, accel_sigma=7.0 m/s^2, vel_sigma=1.0 m/s.
-    """
-    def __init__(self, pos_sigma=0.02, vel_sigma=1.0, accel_sigma=7.0):
+    def __init__(self, pos_sigma=0.02, vel_sigma=3.0, accel_sigma=3.0, drag_coeff=0.1):
         self.x = None
         self.P = None
         self.last_ts = None
-        self.pos_sigma = float(pos_sigma)
-        self.vel_sigma = float(vel_sigma)
-        self.accel_sigma = float(accel_sigma)
-        # thresholds
-        self.z_jump_thresh = 0.30  # if measured z differs from predicted z by >0.30 m -> reset velocity
-
-    def init_from_measurement(self, pos, ts):
-        pos = np.asarray(pos, dtype=np.float64).reshape(3,)
-        self.x = np.zeros((6,), dtype=np.float64)
-        self.x[0:3] = pos
-        self.x[3:6] = 0.0
-        pos_var = (self.pos_sigma)**2
-        vel_var = (self.vel_sigma)**2
-        self.P = np.diag([pos_var, pos_var, pos_var, vel_var, vel_var, vel_var])
-        self.last_ts = float(ts)
-
-    def _build_Q(self, dt):
-        sa = float(self.accel_sigma)
-        dt2 = dt*dt
-        dt3 = dt2*dt
-        qpos = (dt3 / 3.0) * (sa**2)
-        qposvel = (dt2 / 2.0) * (sa**2)
-        qvel = dt * (sa**2)
-        Q = np.zeros((6,6), dtype=np.float64)
-        Q[0,0] = qpos; Q[0,3] = qposvel
-        Q[1,1] = qpos; Q[1,4] = qposvel
-        Q[2,2] = qpos; Q[2,5] = qposvel
-        Q[3,0] = qposvel; Q[3,3] = qvel
-        Q[4,1] = qposvel; Q[4,4] = qvel
-        Q[5,2] = qposvel; Q[5,5] = qvel
-        return Q
-
-    def predict(self, dt):
-        if self.x is None:
-            return
-        x = self.x.copy()
-        x[0] += x[3] * dt
-        x[1] += x[4] * dt
-        x[2] += x[5] * dt - 0.5 * g * dt * dt
-        x[3] += 0.0
-        x[4] += 0.0
-        x[5] += -g * dt
-        self.x = x
-
-        F = np.eye(6,6)
-        F[0,3] = dt; F[1,4] = dt; F[2,5] = dt
-
-        Q = self._build_Q(dt)
-        self.P = F @ self.P @ F.T + Q
-        self.last_ts = (self.last_ts + dt) if self.last_ts is not None else None
+        # Config
+        self.pos_sigma = pos_sigma
+        self.accel_sigma = accel_sigma
+        self.drag = drag_coeff # Simple linear drag: a = -drag * v
+        
+        # Buffer for two-point initialization
+        self.init_buffer = [] 
 
     def update(self, meas_pos, meas_R=None, meas_ts=None):
         t = meas_ts if meas_ts is not None else time.time()
         z = np.asarray(meas_pos, dtype=np.float64).reshape(3,)
+
+        # 1. Handle Initialization (Two-Point Method)
         if self.x is None:
-            self.init_from_measurement(z, t)
+            self.init_buffer.append((t, z))
+            if len(self.init_buffer) < 2:
+                return False # Not ready yet
+            
+            # We have 2 points, calculate initial velocity
+            t0, z0 = self.init_buffer[0]
+            t1, z1 = self.init_buffer[1]
+            dt = t1 - t0
+            if dt <= 0: return False
+            
+            vel = (z1 - z0) / dt
+            
+            self.x = np.zeros((6,), dtype=np.float64)
+            self.x[0:3] = z1 # Current pos
+            self.x[3:6] = vel # Calculated vel
+            
+            # Initialize P with higher velocity uncertainty
+            self.P = np.diag([
+                self.pos_sigma**2, self.pos_sigma**2, self.pos_sigma**2,
+                (self.pos_sigma/dt)**2, (self.pos_sigma/dt)**2, (self.pos_sigma/dt)**2
+            ])
+            self.last_ts = t1
+            print(f"[EKF] Initialized with V={vel}")
             return True
 
-        # If measurement is newer, predict forward to that timestamp
-        if self.last_ts is not None and t > self.last_ts:
-            self.predict(t - self.last_ts)
+        # 2. Prediction Step
+        dt = t - self.last_ts
+        if dt<= 0.0001:
+            return
+        if dt > 0:
+            self.predict(dt)
 
-        # velocity-reset if measurement z deviates too much from predicted z
-        z_pred = self.x[2]
-        if abs(z - z_pred) > self.z_jump_thresh:
-            # reset velocity estimates and inflate their covariances
-            self.x[3:6] = 0.0
-            large_vel_var = (self.vel_sigma * 4.0)**2
-            for i in range(3,6):
-                self.P[i,i] = max(self.P[i,i], large_vel_var)
-            # debug
-            print(f"[EKF] large Z jump detected: meas_z={z:.3f}, pred_z={z_pred:.3f}. Resetting velocities.")
-
-        H = np.zeros((3,6), dtype=np.float64)
+        # 3. Update Step
+        H = np.zeros((3,6))
         H[0,0] = 1; H[1,1] = 1; H[2,2] = 1
+        
+        R = meas_R if meas_R is not None else np.diag([self.pos_sigma**2]*3)
 
-        if meas_R is None:
-            R = np.diag([self.pos_sigma**2]*3)
-        else:
-            R = np.asarray(meas_R, dtype=np.float64)
-
-        z_pred_vec = H @ self.x
-        r = z - z_pred_vec
+        z_pred = H @ self.x
+        y = z - z_pred # Innovation
+        
         S = H @ self.P @ H.T + R
-        try:
-            S_inv = np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            return False
-        d2 = float(r.T @ S_inv @ r)
-        # gating: 99% chi-square 3DOF ~ 11.34
-        if d2 > 11.34:
-            # outlier
-            print(f"[EKF] measurement gated out d2={d2:.2f}")
-            return False
-
-        K = self.P @ H.T @ S_inv
-        self.x = self.x + K @ r
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        self.x = self.x + K @ y
         self.P = (np.eye(6) - K @ H) @ self.P
         self.last_ts = t
         return True
 
+    def predict(self, dt):
+        # State Transition Matrix (F) with simple drag approximation
+        # x_new = x + v*dt
+        # v_new = v + (-g - drag*v)*dt  => v*(1 - drag*dt) - g*dt
+        
+        drag_factor = max(0.0, 1.0 - (self.drag * dt))
+        
+        F = np.eye(6)
+        F[0,3] = dt; F[1,4] = dt; F[2,5] = dt
+        F[3,3] = drag_factor
+        F[4,4] = drag_factor
+        F[5,5] = drag_factor
+        
+        # Predict State
+        self.x[0:3] += self.x[3:6] * dt
+        self.x[3:6] = self.x[3:6] * drag_factor
+        self.x[5]   -= g * dt # Gravity
+        
+        # Predict Covariance
+        Q = np.eye(6) * (self.accel_sigma * dt)**2 
+        self.P = F @ self.P @ F.T + Q
+
     def predict_future(self, tau):
+        """
+        Project the state 'tau' seconds into the future 
+        using the current Drag + Gravity model.
+        """
         if self.x is None:
             return None
-        s = self.x.copy()
-        px = s[0] + s[3]*tau
-        py = s[1] + s[4]*tau
-        pz = s[2] + s[5]*tau - 0.5*g*tau*tau
-        vx = s[3]
-        vy = s[4]
-        vz = s[5] - g*tau
-        return np.array([px,py,pz,vx,vy,vz], dtype=np.float64)
+        
+        # 1. Extract current state
+        pos = self.x[0:3]
+        vel = self.x[3:6]
+        
+        # 2. Calculate Drag Factor for the horizon 'tau'
+        # Same logic as predict(): simple linear decay
+        drag_factor = max(0.0, 1.0 - (self.drag * tau))
+        
+        # 3. Predict Position
+        # p_new = p + v*t 
+        # For Z, we add the standard gravity term: -0.5 * g * t^2
+        pred_pos = pos + vel * tau
+        pred_pos[2] -= 0.5 * g * tau * tau 
+        
+        # 4. Predict Velocity
+        # v_new = v * drag_factor
+        # For Z, we subtract gravity: v_z = v_z - g*t
+        pred_vel = vel * drag_factor
+        pred_vel[2] -= g * tau
+        
+        # Return combined 6-element vector
+        return np.concatenate([pred_pos, pred_vel])
 
 def compute_robot_center_from_tags(tag_info):
     t4 = tag_info.get('tag4', None)
@@ -256,23 +255,84 @@ def compute_robot_center_from_tags(tag_info):
         return center
     return None
 
-def append_prediction_log(predicted_pos, predicted_t, current_time, robot_pos, v_req=None, can_reach=None, measured_pos=None, meas_ts=None, ekf_state=None):
-    entry = {
-        "predicted_pos": [float(predicted_pos[0]), float(predicted_pos[1]), float(predicted_pos[2])],
-        "predicted_t": float(predicted_t),
-        "current_time": float(current_time),
-        "robot_pos": (None if robot_pos is None else [float(robot_pos[0]), float(robot_pos[1]), float(robot_pos[2])]),
-        "v_req": (None if v_req is None else float(v_req)),
-        "can_reach_in_tau": bool(can_reach) if can_reach is not None else None,
-        "measured_pos": (None if measured_pos is None else [float(measured_pos[0]), float(measured_pos[1]), float(measured_pos[2])]),
-        "meas_ts": (None if meas_ts is None else float(meas_ts)),
-        "ekf_state": (None if ekf_state is None else [float(x) for x in ekf_state])
-    }
-    try:
-        with open(_PRED_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception as e:
-        print("[PRED_LOG_ERR]", e)
+# ---------- Async CSV Logging Config ----------
+_PRED_LOG_PATH = f"predictions_log_{int(time.time())}.csv"
+log_queue = queue.Queue()
+
+def logger_worker():
+    """
+    Background thread that pulls data from the queue and writes to CSV.
+    This keeps file I/O off the main camera thread.
+    """
+    # Define CSV Headers
+    headers = [
+        "sys_ts", "pred_ts", "pred_x", "pred_y", "pred_z",
+        "meas_ts", "meas_x", "meas_y", "meas_z",
+        "robot_x", "robot_y", "robot_z", "v_req", "can_reach",
+        "ekf_x", "ekf_y", "ekf_z", "ekf_vx", "ekf_vy", "ekf_vz"
+    ]
+
+    # Check if file exists (to decide whether to write header)
+    file_exists = os.path.isfile(_PRED_LOG_PATH)
+
+    with open(_PRED_LOG_PATH, "a", newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        
+        # Write header only if file is new
+        if not file_exists:
+            writer.writerow(headers)
+        
+        while True:
+            row = log_queue.get()
+            if row is None: # Poison pill to stop thread
+                break
+            writer.writerow(row)
+
+# Start the logging thread immediately
+log_thread = threading.Thread(target=logger_worker, daemon=True)
+log_thread.start()
+
+def append_prediction_log(predicted_pos, predicted_t, current_time, robot_pos, 
+                          v_req=None, can_reach=None, measured_pos=None, 
+                          meas_ts=None, ekf_state=None):
+    """
+    Flattens data into a list and pushes to the async queue.
+    Non-blocking operation (instant return).
+    """
+    
+    # Helper to safely get list indices or return empty string
+    def get_idx(arr, i):
+        return arr[i] if (arr is not None and len(arr) > i) else ""
+    
+    def get_val(v):
+        return v if v is not None else ""
+
+    # Construct the row matching the headers defined in logger_worker
+    row = [
+        current_time,                           # sys_ts
+        predicted_t,                            # pred_ts
+        predicted_pos[0],                       # pred_x
+        predicted_pos[1],                       # pred_y
+        predicted_pos[2],                       # pred_z                 
+        get_val(meas_ts),                       # meas_ts
+        get_idx(measured_pos, 0),               # meas_x
+        get_idx(measured_pos, 1),               # meas_y
+        get_idx(measured_pos, 2),               # meas_z 
+        get_idx(robot_pos, 0),                  # robot_x
+        get_idx(robot_pos, 1),                  # robot_y
+        get_idx(robot_pos, 2),                  # robot_z
+        get_val(v_req),                         # v_req
+        1 if can_reach else 0,                  # can_reach (1/0 for CSV)
+        get_idx(ekf_state, 0),                  # ekf_x
+        get_idx(ekf_state, 1),                  # ekf_y
+        get_idx(ekf_state, 2),                  # ekf_z
+        get_idx(ekf_state, 3),                  # ekf_vx
+        get_idx(ekf_state, 4),                  # ekf_vy
+        get_idx(ekf_state, 5)                   # ekf_vz
+    ]
+
+    # Push to queue (fast!)
+    log_queue.put(row)
 
 # ---------- Color masking helpers ----------
 def hsv_mask_from_vals(bgr_img, hsvVals):
@@ -728,7 +788,7 @@ shared_robot_poses = {}
 last_triangulated_ball = None
 
 # EKF instance (tuned)
-ball_ekf = BallEKF(pos_sigma=0.02, vel_sigma=1.0, accel_sigma=7.0)
+ball_ekf = BallEKF(pos_sigma=0.02, vel_sigma=3.0, accel_sigma=3.0)
 
 for t in SUB_TOPICS:
     cam_name = t.decode()
@@ -960,4 +1020,7 @@ finally:
     cv2.destroyAllWindows()
     sub.close()
     ctx.term()
+    log_queue.put(None) 
+    log_thread.join()
+    print("Logger stopped.")
     print("Exit clean.")
