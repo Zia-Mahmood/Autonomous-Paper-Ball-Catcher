@@ -66,11 +66,11 @@ def create_april_detector():
     params.adaptiveThreshConstant = 7
     return cv2.aruco.ArucoDetector(aruco_dict, params)
 
-orange_hsvVals = {'hmin': 0, 'smin': 127, 'vmin': 115, 'hmax': 27, 'smax': 255, 'vmax': 255}
-purple_hsvVals = {'hmin': 106, 'smin': 83, 'vmin': 49, 'hmax': 132, 'smax': 190, 'vmax': 125}
+orange_hsvVals = {'hmin': 0, 'smin': 100, 'vmin': 200, 'hmax': 13, 'smax': 255, 'vmax': 255}
+purple_hsvVals = {'hmin': 149, 'smin': 69, 'vmin': 82, 'hmax': 177, 'smax': 229, 'vmax': 252}
 
-MIN_AREA = 300
-MAX_AREA = 20000
+MIN_AREA = 500
+MAX_AREA = 4000
 CIRCULARITY_MIN = 0.25
 ASPECT_RATIO_MAX = 2.0
 MAX_DETECTIONS_PER_CAM = 12
