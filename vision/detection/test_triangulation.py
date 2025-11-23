@@ -1,11 +1,11 @@
-import cv2, zmq, numpy as np, time, threading, queue, traceback, sys, os, csv, copy
+import cv2, zmq, numpy as np, time, threading, queue, traceback, sys, os, csv
 from collections import deque, defaultdict
 
 # ---------- Config ----------
 ZMQ_ADDR = "tcp://localhost:5555"
 SUB_TOPICS = [b"kreo1", b"kreo2"]
 FPS_WINDOW = 1.0        
-DISPLAY_FPS = 30        
+DISPLAY_FPS = 70        
 VISUALIZE = True        
 
 # SCALING CONFIG
@@ -19,7 +19,7 @@ CALIB_DIR = "../calibration/"
 # HSV Config
 HSV_CONFIG = {
     "kreo1": { "orange": {'hmin': 0, 'smin': 116, 'vmin': 160, 'hmax': 12, 'smax': 197, 'vmax': 255} },
-    "kreo2": { "orange": {'hmin': 0, 'smin': 110, 'vmin': 181, 'hmax': 10, 'smax': 255, 'vmax': 255} }
+    "kreo2": { "orange": {'hmin': 0, 'smin': 79, 'vmin': 181, 'hmax': 12, 'smax': 255, 'vmax': 255} }
 }
 DEFAULT_HSV = {'hmin': 0, 'smin': 100, 'vmin': 100, 'hmax': 25, 'smax': 255, 'vmax': 255}
 
@@ -68,7 +68,6 @@ class StaticCalibrator:
         self.obs = defaultdict(list)
         self.extrinsics = {}
         self.frame_count = defaultdict(int)
-        self.P_cache = {}              # cam_name -> projection matrix K@[R|t]
         self.K_cache = {}
         self.dist_cache = {}
 
@@ -92,20 +91,14 @@ class StaticCalibrator:
         if cam_name in self.extrinsics: return True
         if self.frame_count.get(cam_name, 0) < CALIB_FRAMES: return False
 
-        target_tag = None
-        if cam_name == "kreo1":
-            target_tag = 2
-        elif cam_name == "kreo2":
-            target_tag = 1
-        else:
-            return False
-
         obs_list = list(reversed(self.obs.get(cam_name, [])))
         
+        target_tag = None
         use_corners = None
 
         for (tid, corners, ts) in obs_list:
-            if int(tid) == int(target_tag):
+            if tid in self.tag_world_map:
+                target_tag = tid
                 use_corners = corners.reshape(4,2).astype(np.float64)
                 break 
         
@@ -115,14 +108,12 @@ class StaticCalibrator:
         except: return False
 
         obj_corners = np.array(self.tag_world_map[target_tag], dtype=np.float64)
-        ok, rvec, tvec = cv2.solvePnP(obj_corners, use_corners, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        ok, rvec, tvec = cv2.solvePnP(obj_corners, use_corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
         if not ok: return False
 
         R, _ = cv2.Rodrigues(rvec)
         tvec = tvec.reshape(3,1)
         self.extrinsics[cam_name] = {"rvec": rvec, "tvec": tvec, "R": R}
-        P = np.hstack((R, tvec))
-        self.P_cache[cam_name] = P
         print(f"[Calib] {cam_name} extrinsics locked using Tag {target_tag}")
         return True
 
@@ -131,22 +122,14 @@ class StaticCalibrator:
         if e is None: raise RuntimeError("Calibrator: extrinsic not ready for " + cam_name)
         R = e['R']; t = e['tvec']
         X = np.asarray(X_cam, dtype=np.float64)
-        if X.ndim == 1 and X.shape[0] == 3:
-            Xc = X.reshape(3,1)
-            Xw = R.T @ (Xc - t)
-            return Xw[:,0]
-        if X.ndim == 2 and X.shape[1] == 3:
-            Xc = X.T  # 3xN
-            Xw = R.T @ (Xc - t)
-            return Xw.T
-        if X.ndim == 2 and X.shape[0] == 3:
-            Xc = X
-            Xw = R.T @ (Xc - t)
-            return Xw.T
-        raise ValueError("Invalid X_cam shape: " + str(X.shape))
+        print(X.ndim)
+        if X.ndim == 1: Xc = X.reshape(3,1); Xw = R.T @ (Xc - t); return Xw[:,0]
+        else: Xc = X.T; Xw = R.T @ (Xc - t); return Xw.T
 
     def get_norm_projection_matrix(self, cam_name):
-        return self.P_cache.get(cam_name, None)
+        e = self.extrinsics.get(cam_name)
+        if e is None: return None
+        return np.hstack((e['R'], e['tvec']))
 
 
 # ---------- Logging Setup ----------
@@ -178,26 +161,6 @@ log_thread.start()
 
 
 # ---------- Helpers ----------
-def fmt_ts(ts):
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + f".{int((ts%1)*1000):03d}"
-
-def recv_latest(sub):
-    msg = None
-    while True:
-        try:
-            msg = sub.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.Again:
-            break
-    return msg
-
-def update_fps(camera, cam_ts):
-    dq = fps_windows[camera]
-    dq.append(cam_ts)
-    # pop older than window
-    while dq and (cam_ts - dq[0]) > FPS_WINDOW:
-        dq.popleft()
-    fps = len(dq) / FPS_WINDOW
-    return fps
 
 def load_camera_calib(cam_name):
     path = os.path.join(CALIB_DIR, f'camera_calibration_{cam_name}.npz')
@@ -235,7 +198,7 @@ def estimate_pose_apriltag(corners, tag_size, cam_mtx, cam_dist):
         [-half, -half, 0.0]
     ], dtype=np.float32)
     imgp = corners.reshape(4,2).astype(np.float32)
-    ok, rvec, tvec = cv2.solvePnP(objp, imgp, cam_mtx, cam_dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    ok, rvec, tvec = cv2.solvePnP(objp, imgp, cam_mtx, cam_dist, flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok: raise RuntimeError("solvePnP failed")
     R, _ = cv2.Rodrigues(rvec)
     T = np.eye(4); T[:3, :3] = R; T[:3, 3] = tvec.reshape(3)
@@ -282,10 +245,6 @@ shared_3d_poses = {
 # Candidates for Ball Triangulation (Written by BallThread, Read by Main)
 shared_ball_candidates = defaultdict(list)
 shared_ball_status = {"kreo1": False, "kreo2": False}
-shared_ball_history = {
-    "kreo1": deque(maxlen=30),   # ~ 30 recent candidates
-    "kreo2": deque(maxlen=30)
-}
 shared_data_lock = threading.Lock()
 viz_cache = {}
 viz_lock = threading.Lock()
@@ -419,15 +378,6 @@ class BallDetectorThread(threading.Thread):
                     # Update candidates for this camera
                     shared_ball_candidates[self.cam_name] = candidates_for_triangulation
                     shared_ball_status[self.cam_name] = ball_data["detected"]
-                    if candidates_for_triangulation:
-                        # store a lightweight record: (ts, centroid, area, color)
-                        for c in candidates_for_triangulation:
-                            shared_ball_history[self.cam_name].append({
-                                "ts": c["ts"],
-                                "centroid": c["centroid"],
-                                "area": c.get("area", 0),
-                                "color": c.get("color", "")
-                            })
                     
                     # Read GLOBAL 3D Data (Calculated by Main Loop or Tag Thread)
                     # Note: There might be a 1-frame delay for Ball 3D, which is acceptable for decoupled logging
@@ -484,9 +434,9 @@ def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
     pair = ('kreo1', 'kreo2') if 'kreo1' in cams and 'kreo2' in cams else (cams[0], cams[1])
     c1, c2 = pair
     
-    # # Filter candidates (sort by area)
-    # cand1 = sorted(camera_candidates[c1], key=lambda x: -x.get('area',1))[:8]
-    # cand2 = sorted(camera_candidates[c2], key=lambda x: -x.get('area',1))[:8]
+    # Filter candidates (sort by area)
+    cand1 = sorted(camera_candidates[c1], key=lambda x: -x.get('area',1))[:8]
+    cand2 = sorted(camera_candidates[c2], key=lambda x: -x.get('area',1))[:8]
 
     # Get Calibration Data
     if c1 not in calibrator.extrinsics or c2 not in calibrator.extrinsics: return []
@@ -497,56 +447,45 @@ def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
     P2_norm = calibrator.get_norm_projection_matrix(c2) # [R2|t2]
 
     results = []
-
-    with shared_data_lock:
-        hist1 = list(shared_ball_history[c1])
-        hist2 = list(shared_ball_history[c2])
     
-    for a in hist1:
-        # for each candidate in hist1 find candidates in hist2 within MAX_TIME_DIFF
-        closest = None
-        best_dt = 1e9
-        for b in hist2:
-            if a['color'] != b['color']: 
-                continue
+    for a in cand1:
+        for b in cand2:
+            if a['color'] != b['color']: continue
+            
             dt = abs(a['ts'] - b['ts'])
-            if dt <= MAX_TIME_DIFF and dt < best_dt:
-                best_dt = dt
-                closest = b
-        if closest is None:
-            continue
+            if dt > MAX_TIME_DIFF: continue
 
-        pt1_in = np.array(a['centroid'], dtype=float).reshape(-1,1,2)
-        pt2_in = np.array(closest['centroid'], dtype=float).reshape(-1,1,2)
+            pt1_in = np.array(a['centroid'], dtype=float).reshape(-1,1,2)
+            pt2_in = np.array(b['centroid'], dtype=float).reshape(-1,1,2)
             
             # Undistort to Normalized Coordinates (x, y) where z=1
-        pt1_norm = cv2.undistortPoints(pt1_in, K1, D1, P=None)
-        pt2_norm = cv2.undistortPoints(pt2_in, K2, D2, P=None)
+            pt1_norm = cv2.undistortPoints(pt1_in, K1, D1, P=None)
+            pt2_norm = cv2.undistortPoints(pt2_in, K2, D2, P=None)
 
-        pt1_norm = pt1_norm.reshape(-1, 2).T  
-        pt2_norm = pt2_norm.reshape(-1, 2).T 
+            pt1_norm = pt1_norm.reshape(-1, 2).T  
+            pt2_norm = pt2_norm.reshape(-1, 2).T 
 
-        # Triangulate in World Frame
-        Xh = cv2.triangulatePoints(P1_norm, P2_norm, pt1_norm, pt2_norm)
-        w = Xh[3]
-        if abs(w) < 1e-6: continue
-        Xw = (Xh[:3] / w).flatten()
-        print("Ball position: ", Xw)
+            # Triangulate in World Frame
+            Xh = cv2.triangulatePoints(P1_norm, P2_norm, pt1_norm, pt2_norm)
+            w = Xh[3]
+            if abs(w) < 1e-6: continue
+            Xw = (Xh[:3] / w).flatten()
 
-        # Reproject to verify
-        img_pt1, _ = cv2.projectPoints(Xw.reshape(1,3), calibrator.extrinsics[c1]['rvec'], calibrator.extrinsics[c1]['tvec'], K1, D1)
-        img_pt2, _ = cv2.projectPoints(Xw.reshape(1,3), calibrator.extrinsics[c2]['rvec'], calibrator.extrinsics[c2]['tvec'], K2, D2)
+            # Reproject to verify
+            img_pt1, _ = cv2.projectPoints(Xw.reshape(1,3), calibrator.extrinsics[c1]['rvec'], calibrator.extrinsics[c1]['tvec'], K1, D1)
+            img_pt2, _ = cv2.projectPoints(Xw.reshape(1,3), calibrator.extrinsics[c2]['rvec'], calibrator.extrinsics[c2]['tvec'], K2, D2)
 
-        err1 = np.linalg.norm(img_pt1.flatten() - np.array(a['centroid']))
-        err2 = np.linalg.norm(img_pt2.flatten() - np.array(b['centroid']))
-        tot_err = err1 + err2
+            err1 = np.linalg.norm(img_pt1.flatten() - np.array(a['centroid']))
+            err2 = np.linalg.norm(img_pt2.flatten() - np.array(b['centroid']))
+            tot_err = err1 + err2
 
-        if tot_err < reproj_thresh_px:
-            results.append({
-                'pt': Xw, 
-                'reproj_err': tot_err, 
-                'ts': max(a['ts'], b['ts']) 
-            })
+            if tot_err < reproj_thresh_px:
+                results.append({
+                    'pt': Xw, 
+                    'reproj_err': tot_err, 
+                    'ts': max(a['ts'], b['ts']) 
+                })
+
     results.sort(key=lambda r: r['reproj_err'])
     return results
 
@@ -586,8 +525,7 @@ try:
     while True:
         # High Speed Ingestion Loop
         try:
-            parts = recv_latest(sub)
-            if parts is None: continue
+            parts = sub.recv_multipart(flags=zmq.NOBLOCK)
             topic = parts[0]
             cam = topic.decode()
             ts_part = parts[1] if len(parts) >= 3 else None
@@ -603,9 +541,7 @@ try:
                 except queue.Full: pass
         except zmq.Again:
             time.sleep(0.0001)
-        with shared_data_lock:
-            ready = all(c in calibrator.extrinsics for c in [t.decode() for t in SUB_TOPICS])
-        if not ready: continue
+
         # ----------------------------------------------------
         #  3D BALL CALCULATION & LOGGING
         # ----------------------------------------------------
@@ -623,14 +559,16 @@ try:
             else:
                 # Optional: Decay old data or keep last known position? 
                 # Keeping last known for now to avoid flickering, or set to None
+                res = None
                 shared_3d_poses["ball"] = None
+                pass 
 
         # ----------------------------------------------------
         #  VISUALIZATION
         # ----------------------------------------------------
         curr_time = time.time()
-        if VISUALIZE and (curr_time - last_show) > (1.0/DISPLAY_FPS):
-            last_show = curr_time
+        if VISUALIZE and (curr_time - last_viz_time) > (1.0/DISPLAY_FPS):
+            last_viz_time = curr_time
             with viz_lock:
                 has_data = all(c in viz_cache for c in ["kreo1", "kreo2"])
                 if has_data:

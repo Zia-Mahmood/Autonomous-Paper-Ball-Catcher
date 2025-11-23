@@ -1,13 +1,13 @@
 {
-  "exp": 120,
+  "exp": 200,
   "focus": 240,
-  "gain": 6,
-  "brightness": 0,
-  "score": 504.851617655462,
+  "gain": 0,
+  "brightness": 16,
+  "score": 494.79623474899165,
   "stats": {
-    "avg_tags": 5.0,
-    "std_tags": 0.0,
-    "fps": 24.25808827731012,
-    "samples": 25
+    "avg_tags": 4.923076923076923,
+    "std_tags": 0.2664693550105965,
+    "fps": 25.766179957026402,
+    "samples": 26
   }
 }
