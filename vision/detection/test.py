@@ -1,434 +1,359 @@
-#!/usr/bin/env python3
-# triangulation.py (Fixed - Stationary Detection + Custom HSV + Optimized)
-import cv2, zmq, numpy as np, time, threading, queue, traceback, sys, os, csv, copy
+import cv2, zmq, numpy as np, time, threading, queue, traceback, os, csv
 from collections import deque, defaultdict
 
 # ---------- Config ----------
 ZMQ_ADDR = "tcp://localhost:5555"
 SUB_TOPICS = [b"kreo1", b"kreo2"]
+
 FPS_WINDOW = 1.0        
-DISPLAY_FPS = 20
-VISUALIZE = True     
+DISPLAY_FPS = 30        
+VISUALIZE = True        
 
-STATIC_TAG_IDS = [0,1,2,3]
-TAG_POSITIONS = {
-    0: np.array([0.9, 0.0, 0.0], dtype=float),
-    1: np.array([0.0, 0.0, 0.0], dtype=float),
-    2: np.array([0.9, 0.9, 0.0], dtype=float),
-    3: np.array([0.0, 1.2, 0.0], dtype=float)
-}
-TAG_SIZES = {0: 0.099, 1: 0.096, 2: 0.096, 3: 0.096, 4: 0.096, 5: 0.096}
-CALIB_FRAMES = 30
-CALIB_DIR = "../calibration/"
+# OPTIMIZATION: Downscale frame for BOTH Ball and Tag detection
+# 0.5 scale = 360p. This is 4x faster than 720p.
+DETECTION_SCALE = 0.5 
 
-# Tuning for Matching
-MAX_TIME_DIFF = 0.08  # Slightly increased to 80ms to catch more pairs if cameras drift
+LOG_DIR = "../../data/detection_logs"
+LOG_FILENAME = f"{LOG_DIR}/log_{int(time.time())}.csv"
 
-# --- USER TUNED HSV VALUES ---
+# HSV Config
 HSV_CONFIG = {
     "kreo1": {
-        "orange": {'hmin': 0, 'smin': 100, 'vmin': 165, 'hmax': 13, 'smax': 255, 'vmax': 255},
-        # Keep purple as backup or ignore if not used
-        "purple": {'hmin': 113,'smin': 78,  'vmin': 3,   'hmax': 129, 'smax': 255, 'vmax': 255}
+        "orange": {'hmin': 0, 'smin': 120, 'vmin': 175, 'hmax': 12, 'smax': 255, 'vmax': 255},
     },
     "kreo2": {
-        "orange": {'hmin': 0, 'smin': 100, 'vmin': 200, 'hmax': 13, 'smax': 255, 'vmax': 255},
-        "purple": {'hmin': 113,'smin': 78,  'vmin': 3,   'hmax': 129, 'smax': 255, 'vmax': 255}
+        "orange": {'hmin': 0, 'smin': 150, 'vmin': 150, 'hmax': 12, 'smax': 255, 'vmax': 255}
     }
 }
+DEFAULT_HSV = {'hmin': 0, 'smin': 100, 'vmin': 100, 'hmax': 25, 'smax': 255, 'vmax': 255}
 
-# Contour Filtering (Tuned for Ball vs Arm)
-MIN_AREA = 20       # Reduced to catch ball far away
-MAX_AREA = 8000
-CIRCULARITY_MIN = 0.5  # Strict circle check to reject Arm/Hand
-ASPECT_RATIO_MIN = 0.6
-ASPECT_RATIO_MAX = 1.6
-MAX_DETECTIONS_PER_CAM = 10
+# Detector parameters
+BASE_MIN_AREA = 100    
+BASE_MAX_AREA = 20000  
+CIRCULARITY_MIN = 0.5
+ASPECT_RATIO_MIN = 0.6 
+ASPECT_RATIO_MAX = 1.6   
+MAX_DETECTIONS_PER_CAM = 5 
 
-# ---------- Async CSV Logging ----------
-log_filename = f"data_log_{int(time.time())}.csv"
+# AprilTag Config
+DICT_TYPE = cv2.aruco.DICT_APRILTAG_36h11
+
+def create_april_detector():
+    aruco_dict = cv2.aruco.getPredefinedDictionary(DICT_TYPE)
+    params = cv2.aruco.DetectorParameters()
+    
+    # TUNING FOR SPEED:
+    # Reduce window size and increase step size to check fewer pixels
+    params.adaptiveThreshWinSizeMin = 3
+    params.adaptiveThreshWinSizeMax = 23  # Reduced from 35
+    params.adaptiveThreshWinSizeStep = 10 # Increased from 2 (checks fewer threshold levels)
+    
+    # Faster corner refinement (SUBPIX is very slow, APRILTAG is balanced)
+    # If you need raw speed, comment out cornerRefinementMethod lines entirely
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG 
+    
+    return cv2.aruco.ArucoDetector(aruco_dict, params)
+
+# ---------- Logging Setup ----------
+if not os.path.exists(LOG_DIR): os.makedirs(LOG_DIR)
 log_queue = queue.Queue()
 
 def logger_worker():
-    with open(log_filename, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        header = ["timestamp", "ball_x", "ball_y", "ball_z", "tag4_x", "tag4_y", "tag4_z", "tag5_x", "tag5_y", "tag5_z"]
-        writer.writerow(header)
-        while True:
-            row = log_queue.get()
-            if row is None: break
-            writer.writerow(row)
+    """
+    Logs: ts, cam, ball_found, ball_x, ball_y, tag4_found, tag4_x, tag4_y, tag5_found, tag5_x, tag5_y
+    """
+    try:
+        with open(LOG_FILENAME, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Header
+            writer.writerow([
+                "timestamp", "camera", 
+                "ball_detected", "ball_x", "ball_y", "ball_area",
+                "tag4_detected", "tag4_x", "tag4_y",
+                "tag5_detected", "tag5_x", "tag5_y"
+            ])
+            while True:
+                entry = log_queue.get()
+                if entry is None: break
+                writer.writerow(entry)
+                log_queue.task_done()
+    except Exception as e: print(f"[LOGGER ERROR] {e}")
 
 log_thread = threading.Thread(target=logger_worker, daemon=True)
 log_thread.start()
 
-# ---------------- APRILTAG CONFIG ----------------
-DICT_TYPE = cv2.aruco.DICT_APRILTAG_36h11
-def create_april_detector():
-    aruco_dict = cv2.aruco.getPredefinedDictionary(DICT_TYPE)
-    params = cv2.aruco.DetectorParameters()
-    # Standard robust parameters
-    params.adaptiveThreshWinSizeMin = 3
-    params.adaptiveThreshWinSizeMax = 35
-    params.adaptiveThreshWinSizeStep = 2
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    return cv2.aruco.ArucoDetector(aruco_dict, params)
-
-# ---------- Helpers ----------
-def fmt_ts(ts): return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + f".{int((ts%1)*1000):03d}"
-
-def recv_latest(sub):
-    msg = None
-    while True:
-        try: msg = sub.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.Again: break
-    return msg
-
-def update_fps(camera, cam_ts):
-    dq = fps_windows[camera]; dq.append(cam_ts)
+# ---------- Helper Functions ----------
+def update_fps(camera, cam_ts, fps_windows):
+    dq = fps_windows[camera]
+    dq.append(cam_ts)
     while dq and (cam_ts - dq[0]) > FPS_WINDOW: dq.popleft()
     return len(dq) / FPS_WINDOW
 
-def load_camera_calib(cam_name):
-    path = os.path.join(CALIB_DIR, f'camera_calibration_{cam_name}.npz')
-    if not os.path.exists(path): raise FileNotFoundError(path)
-    calib = np.load(path)
-    return calib["cameraMatrix"], calib['distCoeffs']
+def get_orange_mask(bgr_img, hsv_dict):
+    hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+    lower = np.array([hsv_dict['hmin'], hsv_dict['smin'], hsv_dict['vmin']], dtype=np.uint8)
+    upper = np.array([hsv_dict['hmax'], hsv_dict['smax'], hsv_dict['vmax']], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    return cv2.GaussianBlur(mask, (5, 5), 0)
 
-def build_tag_world_map_from_centers(tag_centers, tag_sizes):
-    out = {}
-    for tid, center in tag_centers.items():
-        size = tag_sizes.get(tid, tag_sizes.get(1))
-        half = float(size) / 2.0
-        local = np.array([[-half,  half, 0.0], [ half,  half, 0.0], [ half, -half, 0.0], [-half, -half, 0.0]], dtype=np.float64)
-        corners_world = (local + center.reshape(1,3)).astype(np.float64)
-        out[tid] = corners_world
-    return out
-
-TAG_WORLD_MAP = build_tag_world_map_from_centers(TAG_POSITIONS, TAG_SIZES)
-
-# ---------- Color masking helpers ----------
-def hsv_mask_from_vals(hsv_img, hsvVals):
-    lower = np.array([hsvVals['hmin'], hsvVals['smin'], hsvVals['vmin']], dtype=np.uint8)
-    upper = np.array([hsvVals['hmax'], hsvVals['smax'], hsvVals['vmax']], dtype=np.uint8)
-    mask = cv2.inRange(hsv_img, lower, upper)
-    return mask
-
-def postprocess_mask(mask):
-    # Open to remove noise (white dots), Close to fill holes
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    m = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return m
-
-def find_candidate_contours(mask):
+def find_ball_contours(mask, min_area, max_area):
     if mask is None: return []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area < MIN_AREA or area > MAX_AREA: continue
-        
-        # Geometric filters to distinguish Ball vs Arm
+        if area < min_area or area > max_area: continue
         x,y,w,h = cv2.boundingRect(c)
-        aspect = float(w)/float(h) if h>0 else 0.0
-        
+        aspect = float(w)/float(h) if h > 0 else 0
+        if ASPECT_RATIO_MIN>aspect or aspect > ASPECT_RATIO_MAX:
+            continue
         perim = cv2.arcLength(c, True)
         if perim == 0: continue
         circularity = 4 * np.pi * area / (perim * perim)
-
-        # Ball = High Circularity (~0.7-0.9), Arm = Low Circularity
-        if circularity < CIRCULARITY_MIN: continue 
-        
-        # Ball = Square-ish aspect ratio
-        if aspect < ASPECT_RATIO_MIN or aspect > ASPECT_RATIO_MAX: continue
-        
-        candidates.append((c, area, (int(x),int(y),int(w),int(h))))
-        
-    candidates.sort(key=lambda d: d[1], reverse=True)
+        if circularity >= CIRCULARITY_MIN:
+            candidates.append({"bbox": (x,y,w,h), "area": area, "centroid": (x+w//2, y+h//2)})
+    # Return largest ball first
+    candidates.sort(key=lambda d: d["area"], reverse=True)
     return candidates
 
-def estimate_pose_apriltag(corners, tag_size, cam_mtx, cam_dist):
-    half = tag_size / 2.0
-    objp = np.array([[-half,  half, 0.0], [ half,  half, 0.0], [ half, -half, 0.0], [-half, -half, 0.0]], dtype=np.float32)
-    imgp = corners.reshape(4,2).astype(np.float32)
-    ok, rvec, tvec = cv2.solvePnP(objp, imgp, cam_mtx, cam_dist, flags=cv2.SOLVEPNP_ITERATIVE)
-    if not ok: raise RuntimeError("solvePnP failed")
-    R, _ = cv2.Rodrigues(rvec)
-    T = np.eye(4); T[:3, :3] = R; T[:3, 3] = tvec.reshape(3)
-    return T
-
-# APRILTAG THREAD
-class AprilTagThread(threading.Thread):
-    def __init__(self, cam_name, frame_queue, detect_cache, lock, calibrator, shared_robot_poses):
-        super().__init__(daemon=True)
-        self.cam_name = cam_name
-        self.frame_queue = frame_queue
-        self.detect_cache = detect_cache
-        self.lock = lock
-        self.detector = create_april_detector()
-        self.stop_flag = False
-        self.calibrator = calibrator
-        self.shared_robot_poses = shared_robot_poses
-    
-    def run(self):
-        while not self.stop_flag:
-            try: frame,ts = self.frame_queue.get(timeout=0.1)
-            except queue.Empty: continue
-            try:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                corners, ids, _ = self.detector.detectMarkers(gray)
-                det={"corners":corners,"ids":ids,"ts":ts,"det_time":time.time()}
-
-                with self.lock:
-                    if self.cam_name not in self.detect_cache: self.detect_cache[self.cam_name]={}
-                    self.detect_cache[self.cam_name]["tags"]=det
-
-                if ids is not None:
-                    self.calibrator.add_detection(self.cam_name,ids,corners,ts)
-                    self.calibrator.try_compute_extrinsic(self.cam_name)
-                    if self.cam_name in self.calibrator.extrinsics:
-                        K, dist = self.calibrator.load_intrinsics(self.cam_name)
-                        for i,idarr in enumerate(ids):
-                            tid = int(idarr[0])
-                            if tid in (4,5):
-                                corners_i = np.array(corners[i]).reshape(4,2)
-                                T_tag_cam = estimate_pose_apriltag(corners_i, TAG_SIZES[tid], K, dist)
-                                tag_origin_world = self.calibrator.cam_to_world(self.cam_name, T_tag_cam[:3,3].reshape(3,))
-                                with self.lock:
-                                    self.shared_robot_poses[tid] = {'world_pos': tag_origin_world, 'cam': self.cam_name, 'ts': ts}
-            except Exception: traceback.print_exc()
-
-    def stop(self): self.stop_flag = True
-
-# BALL THREAD - FIXED: REMOVED BACKGROUND SUBTRACTION
-class BallThread(threading.Thread):
-    def __init__(self, cam_name, frame_queue, detect_cache, lock, shared_camera_candidates):
+# ---------- Unified Detector Thread ----------
+class DetectorThread(threading.Thread):
+    def __init__(self, cam_name, frame_queue, detect_cache, lock):
         super().__init__(daemon=True)
         self.cam_name = cam_name
         self.frame_queue = frame_queue
         self.detect_cache = detect_cache
         self.lock = lock
         self.stop_flag = False
-        self.shared_camera_candidates = shared_camera_candidates
+        
+        # Ball Setup
+        self.min_area_scaled = BASE_MIN_AREA * (DETECTION_SCALE**2)
+        self.max_area_scaled = BASE_MAX_AREA * (DETECTION_SCALE**2)
+        self.hsv_vals = HSV_CONFIG.get(cam_name, {}).get("orange", DEFAULT_HSV)
+        
+        # Tag Setup
+        self.aruco_detector = create_april_detector()
+        self.scale_inv = 1.0 / DETECTION_SCALE
 
     def run(self):
-        print(f"[{self.cam_name}] BallThread started (HSV Only)")
-        
-        # Get camera specific HSV config
-        cam_hsv = HSV_CONFIG.get(self.cam_name, HSV_CONFIG.get("kreo1")) 
-        
+        print(f"[{self.cam_name}] Unified Detector Thread started.")
         while not self.stop_flag:
-            try: frame,ts=self.frame_queue.get(timeout=0.1)
-            except queue.Empty: continue
             try:
-                # Direct HSV Masking (No Motion Requirement)
-                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                # 1. Get Raw Data
+                jpg_bytes, cam_ts = self.frame_queue.get(timeout=0.1)
                 
-                mask_orange = hsv_mask_from_vals(hsv, cam_hsv["orange"])
-                mask_orange = postprocess_mask(mask_orange)
-                
-                # mask_purple = hsv_mask_from_vals(hsv, cam_hsv["purple"]) # Disable purple if not used
+                # 2. Decode
+                frame = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR)
+                if frame is None: continue
 
-                cand_o = find_candidate_contours(mask_orange)
+                # 3. Create SCALED Image for BOTH detections (Massive speedup)
+                if DETECTION_SCALE != 1.0:
+                    frame_small = cv2.resize(frame, None, fx=DETECTION_SCALE, fy=DETECTION_SCALE, interpolation=cv2.INTER_NEAREST)
+                else:
+                    frame_small = frame
                 
-                dets = []
-                for c, area, (x,y,w,h) in cand_o[:MAX_DETECTIONS_PER_CAM]:
-                     M = cv2.moments(c)
-                     if M["m00"] != 0: cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
-                     else: cx = x + w//2; cy = y + h//2
-                     dets.append({
-                        "bbox":(x,y,w,h), "centroid":(cx,cy), "area":float(area),
-                        "color":"orange", "ts":ts
-                     })
-
-                with self.lock:
-                    if self.cam_name not in self.detect_cache: self.detect_cache[self.cam_name]={}
-                    self.detect_cache[self.cam_name]["balls"] = dets
-                    self.shared_camera_candidates[self.cam_name] = dets
+                # --- PART A: BALL DETECTION (Scaled) ---
+                mask = get_orange_mask(frame_small, self.hsv_vals)
+                balls = find_ball_contours(mask, self.min_area_scaled, self.max_area_scaled)
+                
+                ball_data = {"detected": False, "x": "", "y": "", "area": ""}
+                best_ball = None 
+                
+                if balls:
+                    b = balls[0] 
+                    # Scale back to original resolution
+                    bx, by, bw, bh = b["bbox"]
+                    real_x = int(bx * self.scale_inv)
+                    real_y = int(by * self.scale_inv)
+                    real_w = int(bw * self.scale_inv)
+                    real_h = int(bh * self.scale_inv)
+                    real_area = int(b["area"] * (self.scale_inv**2))
+                    cx, cy = real_x + real_w//2, real_y + real_h//2
                     
-            except Exception: traceback.print_exc()
-    def stop(self): self.stop_flag = True
+                    ball_data = {"detected": True, "x": cx, "y": cy, "area": real_area}
+                    best_ball = {"bbox": (real_x, real_y, real_w, real_h), "centroid": (cx, cy)}
 
-# --- CALIBRATOR ---
-class StaticCalibrator:
-    def __init__(self, tag_world_map, tag_size_map):
-        self.tag_world_map = tag_world_map
-        self.tag_size_map = tag_size_map
-        self.obs = defaultdict(list)
-        self.extrinsics = {}
-        self.frame_count = defaultdict(int)
-        self.K_cache = {}
-        self.dist_cache = {}
-    def load_intrinsics(self, cam_name):
-        if cam_name in self.K_cache: return self.K_cache[cam_name], self.dist_cache[cam_name]
-        camera_matrix, dist_coeffs = load_camera_calib(cam_name)
-        self.K_cache[cam_name] = camera_matrix
-        self.dist_cache[cam_name] = dist_coeffs
-        return camera_matrix, dist_coeffs
-    def add_detection(self, cam_name, ids, corners, ts):
-        if ids is None: return
-        self.frame_count[cam_name] += 1
-        for i, idarr in enumerate(ids):
-            tid = int(idarr[0])
-            if tid in STATIC_TAG_IDS:
-                c = np.array(corners[i]).reshape(4,2).astype(np.float64)
-                self.obs[cam_name].append((tid, c, ts))
-    def try_compute_extrinsic(self, cam_name):
-        if cam_name in self.extrinsics: return True
-        if self.frame_count.get(cam_name, 0) < CALIB_FRAMES: return False
-        obs_list = list(reversed(self.obs.get(cam_name, [])))
-        target_tag = None; use_corners = None
-        for (tid, corners, ts) in obs_list:
-            if tid in self.tag_world_map:
-                target_tag = tid; use_corners = corners.reshape(4,2).astype(np.float64); break
-        if use_corners is None: return False
-        try: K, dist = self.load_intrinsics(cam_name)
-        except: return False
-        obj_corners = np.array(self.tag_world_map[target_tag], dtype=np.float64)
-        ok, rvec, tvec = cv2.solvePnP(obj_corners, use_corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok: return False
-        R, _ = cv2.Rodrigues(rvec)
-        self.extrinsics[cam_name] = {"rvec": rvec, "tvec": tvec.reshape(3,1), "R": R}
-        print(f"[Calib] {cam_name} extrinsics computed using Tag {target_tag}")
-        return True
-    def cam_to_world(self, cam_name, X_cam):
-        e = self.extrinsics.get(cam_name)
-        if e is None: raise RuntimeError("Calibrator: extrinsic not ready for " + cam_name)
-        R = e['R']; t = e['tvec']
-        X = np.asarray(X_cam, dtype=np.float64)
-        if X.ndim == 1: return (R.T @ (X.reshape(3,1) - t))[:,0]
-        return (R.T @ (X.T - t)).T
-    def get_norm_projection_matrix(self, cam_name):
-        e = self.extrinsics.get(cam_name)
-        return np.hstack((e['R'], e['tvec'])) if e else None
+                # --- PART B: APRILTAG DETECTION (Scaled) ---
+                # CRITICAL FIX: Detect on frame_small, not frame
+                gray_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+                corners, ids, rejected = self.aruco_detector.detectMarkers(gray_small)
+                
+                tag4_data = {"detected": False, "x": "", "y": ""}
+                tag5_data = {"detected": False, "x": "", "y": ""}
+                
+                found_tags_viz = [] 
+                
+                if ids is not None:
+                    ids_flat = ids.flatten()
+                    for i, tag_id in enumerate(ids_flat):
+                        # Get center on SMALL image
+                        c_small = corners[i][0]
+                        cx_small = np.mean(c_small[:, 0])
+                        cy_small = np.mean(c_small[:, 1])
+                        
+                        # Scale back to ORIGINAL resolution
+                        cx = int(cx_small * self.scale_inv)
+                        cy = int(cy_small * self.scale_inv)
+                        
+                        # Scale corners for visualization
+                        viz_corners = corners[i] * self.scale_inv
+                        found_tags_viz.append({"id": tag_id, "corners": viz_corners})
 
-def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
-    cams = list(camera_candidates.keys())
-    if len(cams) < 2: return []
-    pair = ('kreo1', 'kreo2') if 'kreo1' in cams and 'kreo2' in cams else (cams[0], cams[1])
-    c1, c2 = pair
-    cand1 = sorted(camera_candidates[c1], key=lambda x: -x.get('area',1))[:8]
-    cand2 = sorted(camera_candidates[c2], key=lambda x: -x.get('area',1))[:8]
-    
-    if c1 not in calibrator.extrinsics or c2 not in calibrator.extrinsics: return []
-    K1, D1 = calibrator.load_intrinsics(c1)
-    K2, D2 = calibrator.load_intrinsics(c2)
-    P1_norm = calibrator.get_norm_projection_matrix(c1)
-    P2_norm = calibrator.get_norm_projection_matrix(c2)
-    
-    results = []
-    for a in cand1:
-        for b in cand2:
-            if a['color'] != b['color']: continue
-            dt = abs(a['ts'] - b['ts'])
-            if dt > MAX_TIME_DIFF: continue
-            
-            # Correct reshaping for undistortPoints: Input (N,1,2) -> Output (N,1,2)
-            pt1_in = np.array(a['centroid'],dtype=float).reshape(-1,1,2)
-            pt2_in = np.array(b['centroid'],dtype=float).reshape(-1,1,2)
-            
-            pt1_norm = cv2.undistortPoints(pt1_in, K1, D1, P=None)
-            pt2_norm = cv2.undistortPoints(pt2_in, K2, D2, P=None)
+                        if tag_id == 4:
+                            tag4_data = {"detected": True, "x": cx, "y": cy}
+                        elif tag_id == 5:
+                            tag5_data = {"detected": True, "x": cx, "y": cy}
 
-            # TriangulatePoints needs (2, N)
-            pt1_norm = pt1_norm.reshape(-1,2).T
-            pt2_norm = pt2_norm.reshape(-1,2).T
+                # --- PART C: LOGGING ---
+                log_row = [
+                    f"{cam_ts:.3f}", self.cam_name,
+                    ball_data["detected"], ball_data["x"], ball_data["y"], ball_data["area"],
+                    tag4_data["detected"], tag4_data["x"], tag4_data["y"],
+                    tag5_data["detected"], tag5_data["x"], tag5_data["y"]
+                ]
+                log_queue.put(log_row)
 
-            Xh = cv2.triangulatePoints(P1_norm, P2_norm, pt1_norm, pt2_norm)
-            w = Xh[3]
-            if abs(w) < 1e-6: continue
-            Xw = (Xh[:3] / w).flatten()
-            
-            # Reprojection Check
-            img_pt1, _ = cv2.projectPoints(Xw.reshape(1,3), calibrator.extrinsics[c1]['rvec'], calibrator.extrinsics[c1]['tvec'], K1, D1)
-            img_pt2, _ = cv2.projectPoints(Xw.reshape(1,3), calibrator.extrinsics[c2]['rvec'], calibrator.extrinsics[c2]['tvec'], K2, D2)
-            
-            tot_err = np.linalg.norm(img_pt1.flatten()-np.array(a['centroid'])) + np.linalg.norm(img_pt2.flatten()-np.array(b['centroid']))
-            
-            if tot_err < reproj_thresh_px:
-                results.append({'pt': Xw, 'reproj_err': tot_err, 'pair': (c1,c2), 'depths': (float(Xw[2]), float(Xw[2])), 'ts': max(a['ts'], b['ts'])})
-    results.sort(key=lambda r: r['reproj_err'])
-    return results
+                # --- PART D: UPDATE CACHE (For Viz) ---
+                with self.lock:
+                    self.detect_cache[self.cam_name] = {
+                        "ball": best_ball,
+                        "tags": found_tags_viz,
+                        "img": frame, 
+                        "fps": 0 
+                    }
 
-# ---------- Main Loop ----------
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"[ERROR-{self.cam_name}]", e)
+                traceback.print_exc()
+
+    def stop(self):
+        self.stop_flag = True
+
+
+# ---------- Main Execution ----------
 ctx = zmq.Context()
 sub = ctx.socket(zmq.SUB)
 sub.connect(ZMQ_ADDR)
-sub.setsockopt(zmq.RCVHWM, 1); sub.setsockopt(zmq.CONFLATE, 1); sub.setsockopt(zmq.LINGER, 0)
+sub.setsockopt(zmq.RCVHWM, 4)
+sub.setsockopt(zmq.CONFLATE, 1) 
+sub.setsockopt(zmq.LINGER, 0)
 for t in SUB_TOPICS: sub.setsockopt(zmq.SUBSCRIBE, t)
 
-frames = {}; fps_windows = defaultdict(lambda: deque())
+# Flush init
+while True:
+    try:
+        sub.recv_multipart(flags=zmq.NOBLOCK)
+    except zmq.Again:
+        break
+
 frame_queues = {t.decode(): queue.Queue(maxsize=1) for t in SUB_TOPICS}
-detect_cache = {}; detect_lock = threading.Lock()
-tag_threads={}; ball_threads={}
+detect_cache = {}        
+detect_lock = threading.Lock()
+detectors = {}
+fps_state = defaultdict(lambda: deque())
 
-calibrator = StaticCalibrator(TAG_WORLD_MAP, TAG_SIZES)
-shared_camera_candidates = defaultdict(list); shared_robot_poses = {}
-last_triangulated_ball = None; last_ekf_ts = -1.0
-
+# Start Threads
 for t in SUB_TOPICS:
-    cam = t.decode()
-    tag_threads[cam] = AprilTagThread(cam,frame_queues[cam],detect_cache,detect_lock,calibrator,shared_robot_poses)
-    ball_threads[cam] = BallThread(cam,frame_queues[cam],detect_cache,detect_lock,shared_camera_candidates)
-    tag_threads[cam].start(); ball_threads[cam].start()
+    cam_name = t.decode()
+    dt = DetectorThread(cam_name, frame_queues[cam_name], detect_cache, detect_lock)
+    dt.start()
+    detectors[cam_name] = dt
 
-print("[Main] Connected.")
+print(f"[Subscriber] Connected to {ZMQ_ADDR}")
+print(f"[Logging] Saving to {LOG_FILENAME}")
+
 last_show = time.time()
 
 try:
     while True:
-        try: parts = sub.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.Again: continue
-        
-        topic=parts[0]; cam=topic.decode()
-        jpg=parts[2] if len(parts)>=3 else parts[1]
-        ts_part=parts[1] if len(parts)>=3 else None
-        cam_ts = float(ts_part.decode()) if ts_part else time.time()
-        
-        img = cv2.imdecode(np.frombuffer(jpg,np.uint8), cv2.IMREAD_COLOR)
-        if img is None: continue
-        
-        frames[cam]={"img":img, "cam_ts":cam_ts, "fps":update_fps(cam,cam_ts)}
-        
-        fq=frame_queues[cam]
-        try: fq.get_nowait()
-        except: pass
-        try: fq.put_nowait((img.copy(),cam_ts))
-        except: pass
-
-        # Triangulation
-        candidates_copy = None; calib_ready = False
-        with detect_lock:
-            if all(c in calibrator.extrinsics for c in [t.decode() for t in SUB_TOPICS]):
-                calib_ready = True; candidates_copy = copy.deepcopy(shared_camera_candidates)
-        
-        if calib_ready and candidates_copy:
-            tri = match_and_triangulate(candidates_copy, calibrator)
-            if tri:
-                best = tri[0]
-                meas_ts = best['ts']
-                # Always log high speed, let EKF filter downstream
-                Xw = best['pt']
-                last_triangulated_ball = {'pos': Xw, 'err': best['reproj_err'], 'ts': meas_ts}
-                log_queue.put([meas_ts, Xw[0], Xw[1], Xw[2], "","","","","",""])
-        
-        # Visuals
-        if VISUALIZE and (time.time()-last_show > 1.0/DISPLAY_FPS) and len(frames)>=2:
-            last_show = time.time()
-            cams = sorted(frames.keys())
-            L = frames[cams[0]]; R = frames[cams[1]]
+        # ZMQ Receiver Loop
+        try:
+            parts = sub.recv_multipart(flags=zmq.NOBLOCK)
+            topic = parts[0]
+            cam = topic.decode()
             
-            # Simple Horizontal Stack
-            imL = cv2.resize(L['img'], (640,360)); imR = cv2.resize(R['img'], (640,360))
-            combo = np.hstack([imL, imR])
-            cv2.putText(combo, f"Drift: {abs(L['cam_ts']-R['cam_ts'])*1000:.1f}ms", (20,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-            cv2.imshow("Stereo", combo)
-            if cv2.waitKey(1)==27: break
+            ts_part = parts[1] if len(parts) >= 3 else None
+            jpg_part = parts[2] if len(parts) >= 3 else parts[1]
+            try:
+                cam_ts = float(ts_part.decode()) if ts_part else time.time()
+            except:
+                cam_ts = time.time()
 
-except KeyboardInterrupt: pass
+            # Pass raw bytes to thread
+            fq = frame_queues.get(cam)
+            if fq:
+                try:
+                    fq.put_nowait((jpg_part, cam_ts))
+                except queue.Full:
+                    # Drop old frame to keep current
+                    try:
+                        fq.get_nowait()
+                        fq.put_nowait((jpg_part, cam_ts))
+                    except: pass
+            
+            # FPS tracking for display
+            cur_fps = update_fps(cam, cam_ts, fps_state)
+            # Inject FPS into cache for Viz to see
+            with detect_lock:
+                if cam in detect_cache:
+                    detect_cache[cam]["fps"] = cur_fps
+
+        except zmq.Again:
+            time.sleep(0.001)
+
+        # Visualization
+        if VISUALIZE and (time.time() - last_show) > (1.0/DISPLAY_FPS):
+            with detect_lock:
+                # Check if we have data for both cams
+                has_data = all(c in detect_cache and "img" in detect_cache[c] for c in ["kreo1", "kreo2"])
+                
+                if has_data:
+                    def draw_overlay(cam_key):
+                        data = detect_cache[cam_key]
+                        im = data["img"].copy()
+                        fps = data.get("fps", 0)
+                        
+                        # Info
+                        cv2.putText(im, f"{cam_key} FPS:{fps:.1f}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                        
+                        # Draw Ball
+                        if data.get("ball"):
+                            bx, by, bw, bh = data["ball"]["bbox"]
+                            cx, cy = data["ball"]["centroid"]
+                            cv2.rectangle(im, (bx,by), (bx+bw, by+bh), (0,165,255), 2)
+                            cv2.circle(im, (cx,cy), 5, (0,0,255), -1)
+                        
+                        # Draw Tags
+                        if data.get("tags"):
+                            for tag in data["tags"]:
+                                cv2.aruco.drawDetectedMarkers(im, [tag["corners"].astype(int)], np.array([[tag["id"]]]))
+                        
+                        return im
+
+                    l_im = draw_overlay("kreo1")
+                    r_im = draw_overlay("kreo2")
+
+                    # Stack
+                    h = min(l_im.shape[0], r_im.shape[0])
+                    if l_im.shape[0] != h: l_im = cv2.resize(l_im, (int(l_im.shape[1]*h/l_im.shape[0]), h))
+                    if r_im.shape[0] != h: r_im = cv2.resize(r_im, (int(r_im.shape[1]*h/r_im.shape[0]), h))
+                    
+                    tile = np.hstack([l_im, r_im])
+                    cv2.imshow("Stereo Tracking", tile)
+                    last_show = time.time()
+            
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+except KeyboardInterrupt:
+    pass
 finally:
-    log_queue.put(None); log_thread.join()
-    for t in tag_threads.values(): t.stop()
-    for t in ball_threads.values(): t.stop()
+    for d in detectors.values(): d.stop()
+    log_queue.put(None)
+    log_thread.join()
     cv2.destroyAllWindows()
+    sub.close()
+    ctx.term()
+    print("\nExiting.")

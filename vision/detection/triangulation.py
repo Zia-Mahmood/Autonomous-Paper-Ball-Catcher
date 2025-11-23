@@ -10,32 +10,34 @@ VISUALIZE = True
 
 STATIC_TAG_IDS = [0,1,2,3]
 TAG_POSITIONS = {
-    0: np.array([0.9, 0.0, 0.0], dtype=float),
+    0: np.array([1.05, 0.0, 0.0], dtype=float),
     1: np.array([0.0, 0.0, 0.0], dtype=float),
-    2: np.array([0.9, 0.9, 0.0], dtype=float),
-    3: np.array([0.0, 1.2, 0.0], dtype=float)
+    2: np.array([1.05, 1.05, 0.0], dtype=float),
+    3: np.array([0.0, 1.05, 0.0], dtype=float)
 }
 TAG_SIZES = {0: 0.099, 1: 0.096, 2: 0.096, 3: 0.096, 4: 0.096, 5: 0.096}
 CALIB_FRAMES = 30
 CALIB_DIR = "../calibration/"
 
 # Tuning for Matching
-MAX_TIME_DIFF = 0.05  # 50ms max difference between camera frames to allow triangulation
+MAX_TIME_DIFF = 0.08
+
+# Contour Filtering
+MIN_AREA = 20       
+MAX_AREA = 8000
+CIRCULARITY_MIN = 0.5  
+ASPECT_RATIO_MIN = 0.6
+ASPECT_RATIO_MAX = 1.6
+MAX_DETECTIONS_PER_CAM = 10
 
 # ---------- Async CSV Logging ----------
 log_filename = f"data_log_{int(time.time())}.csv"
 log_queue = queue.Queue()
 
 def logger_worker():
-    """Background thread to handle file writes without blocking the camera loop."""
     with open(log_filename, mode='w', newline='') as f:
         writer = csv.writer(f)
-        header = [
-            "timestamp", 
-            "ball_x", "ball_y", "ball_z", 
-            "tag4_x", "tag4_y", "tag4_z", 
-            "tag5_x", "tag5_y", "tag5_z"
-        ]
+        header = ["timestamp", "ball_x", "ball_y", "ball_z", "tag4_x", "tag4_y", "tag4_z", "tag5_x", "tag5_y", "tag5_z"]
         writer.writerow(header)
         print(f"[Logging] Started logging to {log_filename}")
         
@@ -43,7 +45,6 @@ def logger_worker():
             row = log_queue.get()
             if row is None: break
             writer.writerow(row)
-            # f.flush() # Optional: Un-comment if you need real-time safety at cost of speed
 
 log_thread = threading.Thread(target=logger_worker, daemon=True)
 log_thread.start()
@@ -69,43 +70,27 @@ def create_april_detector():
 orange_hsvVals = {'hmin': 0, 'smin': 100, 'vmin': 200, 'hmax': 13, 'smax': 255, 'vmax': 255}
 purple_hsvVals = {'hmin': 149, 'smin': 69, 'vmin': 82, 'hmax': 177, 'smax': 229, 'vmax': 252}
 
-MIN_AREA = 500
-MAX_AREA = 4000
-CIRCULARITY_MIN = 0.25
-ASPECT_RATIO_MAX = 2.0
-MAX_DETECTIONS_PER_CAM = 12
-
 # ---------- Helpers ----------
-def fmt_ts(ts):
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + f".{int((ts%1)*1000):03d}"
+def fmt_ts(ts): return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + f".{int((ts%1)*1000):03d}"
 
 def recv_latest(sub):
     msg = None
     while True:
-        try:
-            msg = sub.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.Again:
-            break
+        try: msg = sub.recv_multipart(flags=zmq.NOBLOCK)
+        except zmq.Again: break
     return msg
 
 def update_fps(camera, cam_ts):
-    dq = fps_windows[camera]
-    dq.append(cam_ts)
-    while dq and (cam_ts - dq[0]) > FPS_WINDOW:
-        dq.popleft()
-    fps = len(dq) / FPS_WINDOW
-    return fps
+    dq = fps_windows[camera]; dq.append(cam_ts)
+    while dq and (cam_ts - dq[0]) > FPS_WINDOW: dq.popleft()
+    return len(dq) / FPS_WINDOW
 
 def load_camera_calib(cam_name):
     path = os.path.join(CALIB_DIR, f'camera_calibration_{cam_name}.npz')
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
+    if not os.path.exists(path): raise FileNotFoundError(path)
     calib = np.load(path)
-    camera_matrix = calib["cameraMatrix"]
-    dist_coeffs = calib['distCoeffs']
     print("[INFO] Loaded calibrated camera parameters")
-    return camera_matrix, dist_coeffs
-
+    return calib["cameraMatrix"], calib['distCoeffs']
 
 def build_tag_world_map_from_centers(tag_centers, tag_sizes):
     out = {}
@@ -146,14 +131,18 @@ def find_candidate_contours(mask):
     for c in contours:
         area = cv2.contourArea(c)
         if area < MIN_AREA or area > MAX_AREA: continue
-        perim = cv2.arcLength(c, True)
-        if perim <= 0: continue
-        circularity = 4 * np.pi * area / (perim * perim)
+
         x,y,w,h = cv2.boundingRect(c)
         aspect = float(w)/float(h) if h>0 else 0.0
-        if circularity >= CIRCULARITY_MIN or (0.5*min(w,h) > 5 and area > (MIN_AREA*2)):
-            if aspect <= ASPECT_RATIO_MAX:
-                candidates.append((c, area, (int(x),int(y),int(w),int(h))))
+        perim = cv2.arcLength(c, True)
+        if perim == 0: continue
+        circularity = 4 * np.pi * area / (perim * perim)
+
+        if circularity < CIRCULARITY_MIN: continue 
+        if aspect < ASPECT_RATIO_MIN or aspect > ASPECT_RATIO_MAX: continue
+        
+        candidates.append((c, area, (int(x),int(y),int(w),int(h))))
+        
     candidates.sort(key=lambda d: d[1], reverse=True)
     return candidates
 
@@ -201,38 +190,23 @@ class AprilTagThread(threading.Thread):
 
                 if ids is not None:
                     self.calibrator.add_detection(self.cam_name,ids,corners,ts)
-                    # Try to compute extrinsic immediately if we see a known tag
                     self.calibrator.try_compute_extrinsic(self.cam_name)
-
-                    # (Existing robot tag logic maintained...)
                     if self.cam_name in self.calibrator.extrinsics:
-                        try:
-                            K, dist = self.calibrator.load_intrinsics(self.cam_name)
-                            for i,idarr in enumerate(ids):
-                                tid = int(idarr[0])
-                                if tid in (4,5):
-                                    corners_i = np.array(corners[i]).reshape(4,2)
-                                    T_tag_cam = estimate_pose_apriltag(corners_i, TAG_SIZES[tid], K, dist)
-                                    R_tag_cam = T_tag_cam[:3,:3]
-                                    t_tag_cam = T_tag_cam[:3,3].reshape(3,)
-                                    
-                                    tag_origin_world = self.calibrator.cam_to_world(self.cam_name, t_tag_cam)
-                                    
-                                    with self.lock:
-                                        self.shared_robot_poses[tid] = {
-                                            'world_pos': tag_origin_world,
-                                            'cam': self.cam_name,
-                                            'ts': ts
-                                        }
-                        except Exception as e:
-                            traceback.print_exc()
-            except Exception:
-                traceback.print_exc()
+                        K, dist = self.calibrator.load_intrinsics(self.cam_name)
+                        for i,idarr in enumerate(ids):
+                            tid = int(idarr[0])
+                            if tid in (4,5):
+                                corners_i = np.array(corners[i]).reshape(4,2)
+                                T_tag_cam = estimate_pose_apriltag(corners_i, TAG_SIZES[tid], K, dist)
+                                tag_origin_world = self.calibrator.cam_to_world(self.cam_name, T_tag_cam[:3,3].reshape(3,))
+                                with self.lock:
+                                    self.shared_robot_poses[tid] = {'world_pos': tag_origin_world, 'cam': self.cam_name, 'ts': ts}
+            except Exception: traceback.print_exc()
         print(f"[DETECT-{self.cam_name}] AprilTag Detector thread stopped")
 
     def stop(self): self.stop_flag = True
 
-# BALL THREAD
+# BALL THREAD - DYNAMIC RANGE + MOTION
 class BallThread(threading.Thread):
     def __init__(self, cam_name, frame_queue, detect_cache, lock, shared_camera_candidates):
         super().__init__(daemon=True)
@@ -242,49 +216,48 @@ class BallThread(threading.Thread):
         self.lock = lock
         self.stop_flag = False
         self.shared_camera_candidates = shared_camera_candidates
-    
+        self.bg = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40, detectShadows=False)
+
     def run(self):
-        print(f"[{self.cam_name}] BallThread started")
+        print(f"[{self.cam_name}] BallThread started (Dynamic HSV + Motion)")
         while not self.stop_flag:
             try: frame,ts=self.frame_queue.get(timeout=0.1)
             except queue.Empty: continue
             try:
-                mo=hsv_mask_from_vals(frame,orange_hsvVals)
-                mp=hsv_mask_from_vals(frame,purple_hsvVals)
-                mc = cv2.bitwise_or(mo,mp)
-                mc = postprocess_mask(mc)
-                cand = find_candidate_contours(mc)
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                mask1 = cv2.inRange(hsv, (0, 70, 100), (25, 255, 255))
+                mask2 = cv2.inRange(hsv, (170, 70, 100), (180, 255, 255)) 
+                orange_mask = cv2.bitwise_or(mask1, mask2)
+                motion = self.bg.apply(frame)
+                combined = orange_mask 
 
+                # 4. Clean up noise
+                combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+                combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+
+                # 5. Find Contours
+                cand_o = find_candidate_contours(combined)
+                
                 dets = []
-                for c,area,(x,y,w,h) in cand[:MAX_DETECTIONS_PER_CAM]:
+                for c, area, (x,y,w,h) in cand_o[:MAX_DETECTIONS_PER_CAM]:
                     M = cv2.moments(c)
                     if M["m00"] != 0: cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
                     else: cx = x + w//2; cy = y + h//2
-                    
-                    s_or = int(np.count_nonzero(mo[y:y+h,x:x+w])) if mo is not None else 0
-                    s_pu = int(np.count_nonzero(mp[y:y+h,x:x+w])) if mp is not None else 0
-
-                    if s_or>s_pu and s_or>0: col="orange"
-                    elif s_pu>s_or and s_pu>0: col="purple"
-                    else: col="unknown"
-
                     dets.append({
-                        "bbox":(x,y,w,h),
-                        "centroid":(cx,cy),
-                        "area":float(area),
-                        "color":col,
-                        "ts":ts
+                        "bbox":(x,y,w,h), "centroid":(cx,cy), "area":float(area),
+                        "color":"orange", "ts":ts
                     })
+
                 with self.lock:
                     if self.cam_name not in self.detect_cache: self.detect_cache[self.cam_name]={}
                     self.detect_cache[self.cam_name]["balls"] = dets
                     self.shared_camera_candidates[self.cam_name] = dets
-            except Exception:
-                traceback.print_exc()
+
+            except Exception: traceback.print_exc()
         print(f"[{self.cam_name}] BallDetectorThread stopped")
     def stop(self): self.stop_flag = True
 
-# --- IMPROVED CALIBRATOR ---
+# --- CALIBRATOR ---
 class StaticCalibrator:
     def __init__(self, tag_world_map, tag_size_map):
         self.tag_world_map = tag_world_map
@@ -301,7 +274,7 @@ class StaticCalibrator:
         self.K_cache[cam_name] = camera_matrix
         self.dist_cache[cam_name] = dist_coeffs
         return camera_matrix, dist_coeffs
-
+    
     def add_detection(self, cam_name, ids, corners, ts):
         if ids is None: return
         self.frame_count[cam_name] += 1
@@ -314,31 +287,20 @@ class StaticCalibrator:
     def try_compute_extrinsic(self, cam_name):
         if cam_name in self.extrinsics: return True
         if self.frame_count.get(cam_name, 0) < CALIB_FRAMES: return False
-
-        # FIX 1: Removed hardcoded tag IDs. Use ANY visible tag defined in world map.
         obs_list = list(reversed(self.obs.get(cam_name, [])))
-        
-        target_tag = None
-        use_corners = None
-
+        target_tag = None; use_corners = None
         for (tid, corners, ts) in obs_list:
             if tid in self.tag_world_map:
-                target_tag = tid
-                use_corners = corners.reshape(4,2).astype(np.float64)
-                break # Use the most recent valid tag
-        
-        if use_corners is None: return False # No known tags seen
-
+                target_tag = tid; use_corners = corners.reshape(4,2).astype(np.float64); break
+        if use_corners is None: return False
         try: K, dist = self.load_intrinsics(cam_name)
         except: return False
-
         obj_corners = np.array(self.tag_world_map[target_tag], dtype=np.float64)
         ok, rvec, tvec = cv2.solvePnP(obj_corners, use_corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
         if not ok: return False
 
         R, _ = cv2.Rodrigues(rvec)
-        tvec = tvec.reshape(3,1)
-        self.extrinsics[cam_name] = {"rvec": rvec, "tvec": tvec, "R": R}
+        self.extrinsics[cam_name] = {"rvec": rvec, "tvec": tvec.reshape(3,1), "R": R}
         print(f"[Calib] {cam_name} extrinsics computed using Tag {target_tag}")
         return True
 
@@ -347,16 +309,14 @@ class StaticCalibrator:
         if e is None: raise RuntimeError("Calibrator: extrinsic not ready for " + cam_name)
         R = e['R']; t = e['tvec']
         X = np.asarray(X_cam, dtype=np.float64)
-        if X.ndim == 1: Xc = X.reshape(3,1); Xw = R.T @ (Xc - t); return Xw[:,0]
-        else: Xc = X.T; Xw = R.T @ (Xc - t); return Xw.T
+        if X.ndim == 1: return (R.T @ (X.reshape(3,1) - t))[:,0]
+        return (R.T @ (X.T - t)).T
 
     def get_norm_projection_matrix(self, cam_name):
-        # Returns [R|t] (3x4)
         e = self.extrinsics.get(cam_name)
-        if e is None: return None
-        return np.hstack((e['R'], e['tvec']))
-    
-def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=10.0):
+        return np.hstack((e['R'], e['tvec'])) if e else None
+
+def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
     cams = list(camera_candidates.keys())
     if len(cams) < 2: return []
     
@@ -366,37 +326,31 @@ def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=10.0):
     # Filter candidates (sort by area)
     cand1 = sorted(camera_candidates[c1], key=lambda x: -x.get('area',1))[:8]
     cand2 = sorted(camera_candidates[c2], key=lambda x: -x.get('area',1))[:8]
-    #print(cand1,cand2)
-
-    # Get Calibration Data
+    
     if c1 not in calibrator.extrinsics or c2 not in calibrator.extrinsics: return []
     
     K1, D1 = calibrator.load_intrinsics(c1)
     K2, D2 = calibrator.load_intrinsics(c2)
-    P1_norm = calibrator.get_norm_projection_matrix(c1) # [R1|t1]
-    P2_norm = calibrator.get_norm_projection_matrix(c2) # [R2|t2]
+    P1_norm = calibrator.get_norm_projection_matrix(c1)
+    P2_norm = calibrator.get_norm_projection_matrix(c2)
 
     results = []
-    
     for a in cand1:
         for b in cand2:
-            # FIX 3: Check Color and Timestamp
-            if a['color'] != 'unknown' and b['color'] != 'unknown':
-                if a['color'] != b['color']: continue
-            
+            if a['color'] != b['color']: continue
             dt = abs(a['ts'] - b['ts'])
             if dt > MAX_TIME_DIFF: continue
 
             # FIX 2: Undistort Points before Triangulation
-            pt1 = np.array(a['centroid'], dtype=float).reshape(1,1,2)
-            pt2 = np.array(b['centroid'], dtype=float).reshape(1,1,2)
+            pt1_in = np.array(a['centroid'],dtype=float).reshape(-1,1,2)
+            pt2_in = np.array(b['centroid'],dtype=float).reshape(-1,1,2)
             
             # Undistort to Normalized Coordinates (x, y) where z=1
-            pt1_norm = cv2.undistortPoints(pt1, K1, D1, P=None)
-            pt2_norm = cv2.undistortPoints(pt2, K2, D2, P=None)
+            pt1_norm = cv2.undistortPoints(pt1_in, K1, D1, P=None)
+            pt2_norm = cv2.undistortPoints(pt2_in, K2, D2, P=None)
 
-            pt1_norm = pt1_norm.reshape(-1, 2).T  # Becomes (2, 1)
-            pt2_norm = pt2_norm.reshape(-1, 2).T  # Becomes (2, 1)
+            pt1_norm = pt1_norm.reshape(-1,2).T
+            pt2_norm = pt2_norm.reshape(-1,2).T
 
             # Triangulate in World Frame using Normalized Projection Matrices
             Xh = cv2.triangulatePoints(P1_norm, P2_norm, pt1_norm, pt2_norm)
@@ -422,7 +376,7 @@ def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=10.0):
                     'pt': Xw, 
                     'reproj_err': tot_err, 
                     'pair': (c1,c2), 
-                    'depths': (float(X_cam1[2].item()), float(X_cam2[2].item())),
+                    'depths': (float(Xw[2]), float(Xw[2])),
                     'ts': max(a['ts'], b['ts']) # Use latest ts
                 })
 
@@ -457,7 +411,7 @@ ball_threads={}
 calibrator = StaticCalibrator(TAG_WORLD_MAP, TAG_SIZES)
 shared_camera_candidates = defaultdict(list)
 shared_robot_poses = {}
-last_triangulated_ball = None
+last_triangulated_ball = None; last_ekf_ts = -1.0
 
 for t in SUB_TOPICS:
     cam_name = t.decode()
@@ -507,11 +461,14 @@ try:
         if calib_ready and candidates_copy:
             # Pass the COPY, not the shared dict
             tri_results = match_and_triangulate(candidates_copy, calibrator)
-            
+            last_triangulated_ball = None
             if len(tri_results) > 0:
                 best = tri_results[0]
-                Xw = best['pt']
-                last_triangulated_ball = {'pos': Xw, 'err': best['reproj_err'], 'ts': best['ts'], 'pair': best['pair'], 'depths':best['depths']}
+                meas_ts = best['ts']
+                if meas_ts > last_ekf_ts:
+                    last_ekf_ts = meas_ts
+                    Xw = best['pt']
+                    last_triangulated_ball = {'pos': Xw, 'err': best['reproj_err'], 'ts': meas_ts}
 
             # Logging (Now Async)
             current_time = time.time()
