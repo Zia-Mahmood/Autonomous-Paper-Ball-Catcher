@@ -3,16 +3,17 @@ from collections import deque, defaultdict
 
 # ---------- Config ----------
 ZMQ_ADDR = "tcp://localhost:5555"
+PUB_ADDR = "tcp://*:5566"
 SUB_TOPICS = [b"kreo1", b"kreo2"]
 FPS_WINDOW = 1.0        
 DISPLAY_FPS = 30        
-VISUALIZE = True        
+VISUALIZE = False        
 
 # SCALING CONFIG
 BALL_DETECTION_SCALE = 0.5  # Downscale for speed (Ball)
 TAG_DETECTION_SCALE = 1.0   # Full res for accuracy (Tags)
 
-LOG_DIR = "../../data/triangulation_logs"
+LOG_DIR = "../../data/prediction_free_fall_logs"
 LOG_FILENAME = f"{LOG_DIR}/log_{int(time.time())}.csv"
 CALIB_DIR = "../calibration/"
 
@@ -181,6 +182,11 @@ log_thread.start()
 def fmt_ts(ts):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + f".{int((ts%1)*1000):03d}"
 
+def tag_to_msg(tag_entry):
+    if tag_entry is None:
+        return {"pos": None, "yaw": None, "valid": False}
+    return {"pos": tag_entry["pos"], "yaw": float(tag_entry["yaw"]), "valid": True}
+
 def recv_latest(sub):
     msg = None
     while True:
@@ -335,10 +341,33 @@ class TagDetectorThread(threading.Thread):
                                 K, dist = calibrator.load_intrinsics(self.cam_name)
                                 c_corners = np.array(corners[i]).reshape(4,2)
                                 T_tag_cam = estimate_pose_apriltag(c_corners, TAG_SIZES[tag_id], K, dist)
-                                tag_world = calibrator.cam_to_world(self.cam_name, T_tag_cam[:3,3].reshape(3,))
-                                
+                                ext = calibrator.extrinsics.get(self.cam_name)
+                                if ext is None:
+                                    continue
+                                R_wc = ext['R']                   # world->cam rotation
+                                t_wc = ext['tvec'].reshape(3)     # world->cam translation
+
+                                # camera->world (inverse)
+                                R_cw = R_wc.T
+                                t_cw = -R_cw @ t_wc
+                                T_cam2world = np.eye(4, dtype=np.float64)
+                                T_cam2world[:3,:3] = R_cw
+                                T_cam2world[:3,3]  = t_cw
+
+                                # Transform tag pose into world: T_tag_world = T_cam2world @ T_tag_cam
+                                T_tag_world = T_cam2world @ T_tag_cam
+
+                                # Extract position (x,y,z)
+                                pos = T_tag_world[:3, 3].astype(float)  # numpy array [x,y,z]
+
+                                # Extract yaw (rotation around Z) from rotation matrix
+                                Rtw = T_tag_world[:3, :3]
+                                # yaw = atan2(r21, r11) (standard)
+                                yaw = float(np.arctan2(Rtw[1,0], Rtw[0,0]))
+
+                                # Store full pose dictionary (pos & yaw)
                                 with shared_data_lock:
-                                    shared_3d_poses[tag_id] = tag_world
+                                    shared_3d_poses[tag_id] = {"pos": [float(pos[0]), float(pos[1]), float(pos[2])], "yaw": yaw}
                                     if tag_id == 4: local_tag4_det = True
                                     if tag_id == 5: local_tag5_det = True
                             except Exception as e:
@@ -442,8 +471,8 @@ class BallDetectorThread(threading.Thread):
                 
                 # --- LOGGING (Driven by this thread) ---
                 b3d = ball_3d if ball_3d is not None else ["", "", ""]
-                t4d = tag4_3d if tag4_3d is not None else ["", "", ""]
-                t5d = tag5_3d if tag5_3d is not None else ["", "", ""]
+                t4d = tag4_3d["pos"] if tag4_3d is not None else ["", "", ""]
+                t5d = tag5_3d["pos"] if tag5_3d is not None else ["", "", ""]
 
                 log_queue.put([
                     f"{cam_ts:.3f}", self.cam_name,
@@ -468,9 +497,6 @@ class BallDetectorThread(threading.Thread):
                             "tags": tags_viz,
                             "fps": fps
                         }
-
-            except queue.Empty:
-                pass
             except Exception as e:
                 print(f"[BALL-ERR-{self.cam_name}]", e)
     
@@ -550,13 +576,22 @@ def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
     return results
 
 # ---------- Main Execution ----------
+
 ctx = zmq.Context()
+pub = ctx.socket(zmq.PUB)
+pub.setsockopt(zmq.SNDHWM,4)
+pub.setsockopt(zmq.LINGER,0)
+pub.bind(PUB_ADDR)
+time.sleep(0.05)
+
 sub = ctx.socket(zmq.SUB)
 sub.connect(ZMQ_ADDR)
 sub.setsockopt(zmq.RCVHWM, 4)
 sub.setsockopt(zmq.CONFLATE, 1) 
 sub.setsockopt(zmq.LINGER, 0)
 for t in SUB_TOPICS: sub.setsockopt(zmq.SUBSCRIBE, t)
+
+
 
 # Init Queues (2 per camera: 1 for Ball, 1 for Tag)
 queues = {
@@ -623,6 +658,27 @@ try:
                 # Optional: Decay old data or keep last known position? 
                 # Keeping last known for now to avoid flickering, or set to None
                 shared_3d_poses["ball"] = None
+            ball = shared_3d_poses.get("ball")
+            tag4 = shared_3d_poses.get(4)
+            tag5 = shared_3d_poses.get(5)
+
+        payload = {
+            "ts": time.time(),
+            "ball": {
+                "x": float(ball[0]) if (ball is not None) else None,
+                "y": float(ball[1]) if (ball is not None) else None,
+                "z": float(ball[2]) if (ball is not None) else None,
+                "valid": bool(ball is not None)
+            },
+            "tag4": tag_to_msg(tag4),
+            "tag5": tag_to_msg(tag5)
+        }
+        try:
+            # topicless PUB; planner will subscribe and read raw JSON bytes
+            pub.send_json(payload)
+        except Exception as e:
+            # don't crash detection loop for one send failure
+            print("[PUB-ERR]", e)
 
         # ----------------------------------------------------
         #  VISUALIZATION
@@ -656,7 +712,7 @@ try:
                         
                         for tid in [4, 5]:
                             if shared_3d_poses[tid] is not None:
-                                tp = shared_3d_poses[tid]
+                                tp = shared_3d_poses[tid]["pos"]
                                 cv2.putText(im, f"Tag {tid} 3D: {tp[0]:.2f}, {tp[1]:.2f}, {tp[2]:.2f}", (10, y_off), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
                                 y_off += 25
@@ -688,5 +744,6 @@ finally:
     log_thread.join()
     cv2.destroyAllWindows()
     sub.close()
+    pub.close()
     ctx.term()
     print("\nClean exit.")
