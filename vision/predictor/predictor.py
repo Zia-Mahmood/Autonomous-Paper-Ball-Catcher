@@ -5,13 +5,12 @@ from collections import deque, defaultdict
 ZMQ_ADDR = "tcp://localhost:5555"
 PUB_ADDR = "tcp://*:5566"
 SUB_TOPICS = [b"kreo1", b"kreo2"]
-FPS_WINDOW = 1.0        
-DISPLAY_FPS = 30        
-VISUALIZE = False        
+FPS_WINDOW = 1.0
+DISPLAY_FPS = 30
+VISUALIZE = True
 
-# SCALING CONFIG
-BALL_DETECTION_SCALE = 0.5  # Downscale for speed (Ball)
-TAG_DETECTION_SCALE = 1.0   # Full res for accuracy (Tags)
+BALL_DETECTION_SCALE = 0.5
+TAG_DETECTION_SCALE = 1.0
 
 LOG_DIR = "../../data/prediction_free_fall_logs"
 LOG_FILENAME = f"{LOG_DIR}/log_{int(time.time())}.csv"
@@ -25,12 +24,12 @@ HSV_CONFIG = {
 DEFAULT_HSV = {'hmin': 0, 'smin': 100, 'vmin': 100, 'hmax': 25, 'smax': 255, 'vmax': 255}
 
 # Detector parameters
-BASE_MIN_AREA = 100    
-BASE_MAX_AREA = 20000  
+BASE_MIN_AREA = 100
+BASE_MAX_AREA = 20000
 CIRCULARITY_MIN = 0.5
-ASPECT_RATIO_MIN = 0.6 
-ASPECT_RATIO_MAX = 1.6   
-MAX_DETECTIONS_PER_CAM = 5 
+ASPECT_RATIO_MIN = 0.6
+ASPECT_RATIO_MAX = 1.6
+MAX_DETECTIONS_PER_CAM = 5
 
 # 3D / TRIANGULATION CONFIG
 STATIC_TAG_IDS = [0,1,2,3]
@@ -41,7 +40,7 @@ TAG_POSITIONS = {
     3: np.array([0.0, 0.9, 0.0], dtype=float)
 }
 TAG_SIZES = {0: 0.099, 1: 0.096, 2: 0.096, 3: 0.096, 4: 0.096, 5: 0.096}
-CALIB_FRAMES = 30
+CALIB_FRAMES = 60
 MAX_TIME_DIFF = 0.05  # Max ms diff for triangulation pairing
 
 # AprilTag Config
@@ -69,9 +68,12 @@ class StaticCalibrator:
         self.obs = defaultdict(list)
         self.extrinsics = {}
         self.frame_count = defaultdict(int)
-        self.P_cache = {}              # cam_name -> projection matrix K@[R|t]
+        self.P_cache = {}
         self.K_cache = {}
         self.dist_cache = {}
+        self.calib_observations = defaultdict(list)  # cam_name -> list of (rvec, tvec, reprojection_error)
+        self.MAX_CALIB_OBS = 50  # Number of observations to collect
+        self.REPROJ_ERROR_THRESHOLD = 2.0
 
     def load_intrinsics(self, cam_name):
         if cam_name in self.K_cache: return self.K_cache[cam_name], self.dist_cache[cam_name]
@@ -89,6 +91,13 @@ class StaticCalibrator:
                 c = np.array(corners[i]).reshape(4,2).astype(np.float64)
                 self.obs[cam_name].append((tid, c, ts))
 
+    def compute_reprojection_error(self, obj_corners, img_corners, rvec, tvec, K, dist):
+        """Calculate mean reprojection error in pixels"""
+        projected, _ = cv2.projectPoints(obj_corners, rvec, tvec, K, dist)
+        projected = projected.reshape(-1, 2)
+        error = np.linalg.norm(projected - img_corners, axis=1).mean()
+        return error
+
     def try_compute_extrinsic(self, cam_name):
         if cam_name in self.extrinsics: return True
         if self.frame_count.get(cam_name, 0) < CALIB_FRAMES: return False
@@ -101,30 +110,65 @@ class StaticCalibrator:
         else:
             return False
 
-        obs_list = list(reversed(self.obs.get(cam_name, [])))
-        
-        use_corners = None
+        try: 
+            K, dist = self.load_intrinsics(cam_name)
+        except: 
+            return False
 
-        for (tid, corners, ts) in obs_list:
-            if int(tid) == int(target_tag):
-                use_corners = corners.reshape(4,2).astype(np.float64)
-                break 
+        obs_list = [(tid, corners, ts) for (tid, corners, ts) in self.obs.get(cam_name, []) 
+                    if int(tid) == int(target_tag)]
         
-        if use_corners is None: return False 
-
-        try: K, dist = self.load_intrinsics(cam_name)
-        except: return False
+        if len(obs_list) < 10:  # Need at least 10 good observations
+            return False
 
         obj_corners = np.array(self.tag_world_map[target_tag], dtype=np.float64)
-        ok, rvec, tvec = cv2.solvePnP(obj_corners, use_corners, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-        if not ok: return False
+        
+        for (tid, corners, ts) in obs_list[-60:]:  # Use last 30 observations
+            use_corners = corners.reshape(4, 2).astype(np.float64)
+            
+            ok, rvec, tvec = cv2.solvePnP(
+                obj_corners, use_corners, K, dist, 
+                flags=cv2.SOLVEPNP_ITERATIVE 
+            )
+            
+            if not ok: 
+                continue
+            
+            reproj_error = self.compute_reprojection_error(
+                obj_corners, use_corners, rvec, tvec, K, dist
+            )
+            
+            if reproj_error < self.REPROJ_ERROR_THRESHOLD:
+                self.calib_observations[cam_name].append({
+                    'rvec': rvec.copy(),
+                    'tvec': tvec.copy(),
+                    'error': reproj_error,
+                    'ts': ts
+                })
 
-        R, _ = cv2.Rodrigues(rvec)
-        tvec = tvec.reshape(3,1)
-        self.extrinsics[cam_name] = {"rvec": rvec, "tvec": tvec, "R": R}
-        P = np.hstack((R, tvec))
+        if len(self.calib_observations[cam_name]) < 10:
+            return False
+        valid_obs = sorted(self.calib_observations[cam_name], key=lambda x: x['error'])[:20]
+        
+        rvecs = np.array([obs['rvec'].flatten() for obs in valid_obs])
+        tvecs = np.array([obs['tvec'].flatten() for obs in valid_obs])
+        
+        rvec_avg = np.median(rvecs, axis=0).reshape(3, 1)
+        tvec_avg = np.median(tvecs, axis=0).reshape(3, 1)
+        
+        R, _ = cv2.Rodrigues(rvec_avg)
+        
+        self.extrinsics[cam_name] = {
+            "rvec": rvec_avg,
+            "tvec": tvec_avg,
+            "R": R
+        }
+        
+        P = np.hstack((R, tvec_avg))
         self.P_cache[cam_name] = P
-        print(f"[Calib] {cam_name} extrinsics locked using Tag {target_tag}")
+        T = np.eye(4); T[:3, :3] = R.T; T[:3, 3] = -R.T @ tvec.reshape(3)
+
+        print(f"[Calib] {cam_name} extrinsics locked using Tag {target_tag} {T}")
         return True
 
     def cam_to_world(self, cam_name, X_cam):
@@ -145,6 +189,27 @@ class StaticCalibrator:
             Xw = R.T @ (Xc - t)
             return Xw.T
         raise ValueError("Invalid X_cam shape: " + str(X.shape))
+    
+    def get_3d(self, cam_name, X_3d):
+        e = self.extrinsics.get(cam_name)
+        if e is None: 
+            raise RuntimeError("Calibrator: extrinsic not ready for " + cam_name)
+        
+        R = e['R']
+        tvec = e['tvec'].flatten() 
+        t = -R.T @ tvec
+        X_3d = np.array(X_3d).flatten()
+        v = X_3d - t
+        target_z = 0.075
+        if v[2] == 0:
+            raise RuntimeError("Ray is parallel to the target Z plane.")
+            
+        k = (target_z - t[2]) / v[2]
+        intersection_point = t + k * v
+        intersection_point[2] = target_z
+
+        return intersection_point
+    
 
     def get_norm_projection_matrix(self, cam_name):
         return self.P_cache.get(cam_name, None)
@@ -159,7 +224,7 @@ def logger_worker():
         with open(LOG_FILENAME, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timestamp","camera", 
+                "timestamp","camera",
                 "ball_2d_x", "ball_2d_y", "ball_2d_area",
                 "ball_3d_x", "ball_3d_y", "ball_3d_z",
                 "tag4_x", "tag4_y", "tag4_z",
@@ -358,7 +423,9 @@ class TagDetectorThread(threading.Thread):
                                 T_tag_world = T_cam2world @ T_tag_cam
 
                                 # Extract position (x,y,z)
-                                pos = T_tag_world[:3, 3].astype(float)  # numpy array [x,y,z]
+                                pos = T_tag_world[:3, 3]  # numpy array [x,y,z]
+                                pos = calibrator.get_3d(self.cam_name,pos).astype(float)
+                                print(pos)
 
                                 # Extract yaw (rotation around Z) from rotation matrix
                                 Rtw = T_tag_world[:3, :3]
@@ -506,15 +573,10 @@ class BallDetectorThread(threading.Thread):
 def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
     cams = list(camera_candidates.keys())
     if len(cams) < 2: return []
-    
+
     pair = ('kreo1', 'kreo2') if 'kreo1' in cams and 'kreo2' in cams else (cams[0], cams[1])
     c1, c2 = pair
-    
-    # # Filter candidates (sort by area)
-    # cand1 = sorted(camera_candidates[c1], key=lambda x: -x.get('area',1))[:8]
-    # cand2 = sorted(camera_candidates[c2], key=lambda x: -x.get('area',1))[:8]
 
-    # Get Calibration Data
     if c1 not in calibrator.extrinsics or c2 not in calibrator.extrinsics: return []
     
     K1, D1 = calibrator.load_intrinsics(c1)
@@ -568,9 +630,9 @@ def match_and_triangulate(camera_candidates, calibrator, reproj_thresh_px=15.0):
 
         if tot_err < reproj_thresh_px:
             results.append({
-                'pt': Xw, 
-                'reproj_err': tot_err, 
-                'ts': max(a['ts'], b['ts']) 
+                'pt': Xw,
+                'reproj_err': tot_err,
+                'ts': max(a['ts'], b['ts'])
             })
     results.sort(key=lambda r: r['reproj_err'])
     return results
@@ -618,7 +680,6 @@ last_show = time.time()
 
 try:
     while True:
-        # High Speed Ingestion Loop
         try:
             parts = recv_latest(sub)
             if parts is None: continue
