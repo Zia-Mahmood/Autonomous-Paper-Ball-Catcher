@@ -123,7 +123,9 @@ class StaticCalibrator:
         self.extrinsics[cam_name] = {"rvec": rvec, "tvec": tvec, "R": R}
         P = np.hstack((R, tvec))
         self.P_cache[cam_name] = P
-        print(f"[Calib] {cam_name} extrinsics locked using Tag {target_tag}")
+        T = np.eye(4); T[:3, :3] = R.T; T[:3, 3] = -R.T @ tvec.reshape(3)
+
+        print(f"[Calib] {cam_name} extrinsics locked using Tag {target_tag} {T}")
         return True
 
     def cam_to_world(self, cam_name, X_cam):
